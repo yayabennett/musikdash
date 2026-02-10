@@ -21,28 +21,20 @@ export default async function handler(req, res) {
 
   const { id } = req.query;
   try {
-    const songs = await db.getSongs();
-    const song = songs.find((s) => String(s.id) === String(id));
+    const song = await db.getSongById(Number(id));
     if (!song) return res.status(404).json({ error: 'not found' });
 
-    // Extract the R2 object key from the stored URL
     const bucket = process.env.R2_BUCKET;
-    let objectKey = '';
-
-    // The stored filename looks like: https://...cloudflarestorage.com/bucket/KEY
-    // or /r2/KEY
-    if (song.filename.startsWith('/r2/')) {
-      objectKey = decodeURIComponent(song.filename.replace('/r2/', ''));
-    } else {
-      // extract key from full URL: endpoint/bucket/key
-      const url = new URL(song.filename);
+    // Support both new (just key) and legacy (full URL or /r2/key) formats
+    let objectKey = song.filename;
+    if (objectKey.startsWith('/r2/')) {
+      objectKey = decodeURIComponent(objectKey.replace('/r2/', ''));
+    } else if (objectKey.startsWith('http')) {
+      const url = new URL(objectKey);
       const parts = url.pathname.split('/').filter(Boolean);
-      // remove bucket name if it's the first segment
-      if (parts[0] === bucket) {
-        objectKey = decodeURIComponent(parts.slice(1).join('/'));
-      } else {
-        objectKey = decodeURIComponent(parts.join('/'));
-      }
+      objectKey = parts[0] === bucket
+        ? decodeURIComponent(parts.slice(1).join('/'))
+        : decodeURIComponent(parts.join('/'));
     }
 
     const client = getS3Client();

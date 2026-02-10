@@ -93,21 +93,10 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'upload to R2 failed: ' + e.message });
     }
 
-    let publicUrl = '';
-    if (process.env.R2_ENDPOINT) {
-      const ep = process.env.R2_ENDPOINT.replace(/\/$/, '');
-      publicUrl = `${ep}/${bucket}/${encodeURIComponent(key)}`;
-    } else if (process.env.R2_PUBLIC_URL_BASE) {
-      const base = process.env.R2_PUBLIC_URL_BASE.replace(/\/$/, '');
-      publicUrl = `${base}/${encodeURIComponent(key)}`;
-    } else {
-      publicUrl = `/r2/${encodeURIComponent(key)}`;
-    }
-    
-    console.log('[upload] Public URL:', publicUrl);
+    console.log('[upload] R2 key:', key);
 
     try {
-      const song = await db.addSong(publicUrl, file.originalFilename || file.name || key, username, type);
+      const song = await db.addSong(key, file.originalFilename || file.name || key, username, type);
       console.log('[upload] DB entry created:', song.id);
       res.json(song);
     } catch (e) {

@@ -1,8 +1,21 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react';
 import Head from 'next/head';
 
+// ─── Global Audio Context (only one song plays at a time) ───
+const AudioContext = createContext({ playing: null, setPlaying: () => {} });
+
+function AudioProvider({ children }) {
+  const [playing, setPlaying] = useState(null);
+  return (
+    <AudioContext.Provider value={{ playing, setPlaying }}>
+      {children}
+    </AudioContext.Provider>
+  );
+}
+
 // ─── Custom Audio Player ───
-function AudioPlayer({ src, type }) {
+function AudioPlayer({ src, type, songId }) {
+  const { playing: globalPlaying, setPlaying: setGlobalPlaying } = useContext(AudioContext);
   const audioRef = useRef(null);
   const progressRef = useRef(null);
   const volumeTrackRef = useRef(null);
@@ -33,40 +46,58 @@ function AudioPlayer({ src, type }) {
 
   const toggle = () => {
     if (!audioRef.current) return;
-    if (playing) audioRef.current.pause();
-    else audioRef.current.play().catch(() => {});
+    if (playing) {
+      audioRef.current.pause();
+    } else {
+      setGlobalPlaying(songId);
+      audioRef.current.play().catch(() => {});
+    }
   };
+
+  // Stop when another song starts playing
+  useEffect(() => {
+    if (globalPlaying !== songId && playing && audioRef.current) {
+      audioRef.current.pause();
+    }
+  }, [globalPlaying, songId, playing]);
 
   const seek = (e) => {
     if (!audioRef.current || !progressRef.current) return;
     const rect = progressRef.current.getBoundingClientRect();
-    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     audioRef.current.currentTime = pct * duration;
   };
 
   const applyVolume = useCallback((e) => {
     if (!volumeTrackRef.current) return;
     const rect = volumeTrackRef.current.getBoundingClientRect();
-    const sliderPos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const sliderPos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     setVolume(sliderPos);
     const linear = dbToLinear(sliderToDb(sliderPos));
     if (audioRef.current) audioRef.current.volume = linear;
   }, []);
 
   const onVolDown = (e) => {
+    e.preventDefault();
     setDraggingVol(true);
     applyVolume(e);
   };
 
   useEffect(() => {
     if (!draggingVol) return;
-    const onMove = (e) => applyVolume(e);
+    const onMove = (e) => { e.preventDefault(); applyVolume(e); };
     const onUp = () => setDraggingVol(false);
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    window.addEventListener('touchmove', onMove, { passive: false });
+    window.addEventListener('touchend', onUp);
     return () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('touchmove', onMove);
+      window.removeEventListener('touchend', onUp);
     };
   }, [draggingVol, applyVolume]);
 
@@ -118,7 +149,7 @@ function AudioPlayer({ src, type }) {
       </div>
 
       <span className="player-time">{fmt(currentTime)}</span>
-      <div className="progress-bar" ref={progressRef} onClick={seek}>
+      <div className="progress-bar" ref={progressRef} onClick={seek} onTouchStart={seek}>
         <div className={`progress-bar-fill ${fillClass}`} style={{ width: `${pct}%` }} />
       </div>
       <span className="player-time">{fmt(duration)}</span>
@@ -128,7 +159,7 @@ function AudioPlayer({ src, type }) {
           {volume < 0.05 ? '🔇' : volume < 0.35 ? '🔈' : volume < 0.65 ? '🔉' : '🔊'}
         </button>
         <div className="volume-track-wrap">
-          <div className="volume-track" ref={volumeTrackRef} onMouseDown={onVolDown}>
+          <div className="volume-track" ref={volumeTrackRef} onMouseDown={onVolDown} onTouchStart={onVolDown}>
             <div className="volume-track-fill" style={{ width: `${volPct}%` }} />
           </div>
           <span className="volume-db">{getDB()} dB</span>
@@ -372,7 +403,7 @@ function SongCard({ song, type, canDelete, onDelete, user, ratings, onRate, show
           )}
         </div>
       </div>
-      <AudioPlayer src={`/api/stream/${song.id}`} type={type} />
+      <AudioPlayer src={`/api/stream/${song.id}`} type={type} songId={song.id} />
       <RatingPanel songId={song.id} user={user} ratings={ratings} onRate={onRate} showToast={showToast} />
     </div>
   );
@@ -428,6 +459,17 @@ export default function Home() {
     }
   };
 
+  const refreshSongRatings = async (songId) => {
+    try {
+      const res = await fetch(`/api/ratings?song_id=${songId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setRatings(prev => ({ ...prev, [songId]: data }));
+    } catch (err) {
+      console.error('Failed to refresh song ratings', err);
+    }
+  };
+
   const handleLogin = (e) => {
     e.preventDefault();
     const name = usernameInput.trim();
@@ -438,7 +480,7 @@ export default function Home() {
     const normalizedName = name.toLowerCase();
     setUser(normalizedName);
     localStorage.setItem('musik_user', normalizedName);
-    document.cookie = `username=${normalizedName}; path=/; max-age=${60 * 60 * 24 * 365}`;
+    document.cookie = `username=${normalizedName}; path=/; max-age=${60 * 60 * 24 * 365}; SameSite=Strict; Secure`;
     showToast(`Willkommen, ${normalizedName}!`);
     setUsernameInput('');
   };
@@ -518,10 +560,17 @@ export default function Home() {
   const songsByType = (type) => songs.filter(s => (s.type || 'song') === type);
 
   return (
+    <AudioProvider>
     <div className="container">
       <Head>
         <title>{`Musik — ${user ? 'Bennett' : 'Library'}`}</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+        <meta name="description" content="Bennetts persönliche Musik-Bibliothek — Songs anhören, bewerten und entdecken." />
+        <meta property="og:title" content="Musik — Bennett" />
+        <meta property="og:description" content="Persönliche Musik-Bibliothek mit Songs, Skizzen und Community-Bewertungen." />
+        <meta property="og:type" content="website" />
+        <meta name="theme-color" content="#0a0a0c" />
+        <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>" />
       </Head>
 
       <header className="header">
@@ -620,7 +669,7 @@ export default function Home() {
                 onDelete={handleDelete}
                 user={user}
                 ratings={ratings[song.id] || []}
-                onRate={fetchAllRatings}
+                onRate={() => refreshSongRatings(song.id)}
                 showToast={showToast}
               />
             ))}
@@ -646,7 +695,7 @@ export default function Home() {
                 onDelete={handleDelete}
                 user={user}
                 ratings={ratings[song.id] || []}
-                onRate={fetchAllRatings}
+                onRate={() => refreshSongRatings(song.id)}
                 showToast={showToast}
               />
             ))}
@@ -668,5 +717,6 @@ export default function Home() {
         {toast.message}
       </div>
     </div>
+    </AudioProvider>
   );
 }
