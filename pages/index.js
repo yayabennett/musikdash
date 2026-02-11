@@ -1,11 +1,21 @@
-import { useState, useEffect, useRef, useCallback, createContext, useContext, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, createContext, useContext, useMemo, memo } from 'react';
 import Head from 'next/head';
+import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
+import toast from 'react-hot-toast';
+import { useDropzone } from 'react-dropzone';
+import { formatDistanceToNow } from 'date-fns';
+import { de } from 'date-fns/locale';
+import { 
+  HiPlay, HiPause, HiSpeakerWave, HiSpeakerXMark, 
+  HiMagnifyingGlass, HiArrowDownTray, HiXMark, HiPlus,
+  HiMusicalNote, HiSparkles, HiArrowRightOnRectangle,
+  HiChevronRight, HiStar, HiClock
+} from 'react-icons/hi2';
 
 // ─── Global Audio Context ───
-const AudioContext = createContext({ 
+const AudioCtx = createContext({ 
   playingId: null, 
   setPlayingId: () => {}, 
-  songs: [], 
   playNext: () => {},
   isPlaying: false,
   setIsPlaying: () => {}
@@ -28,165 +38,102 @@ function AudioProvider({ children, songs }) {
   }, [playingId, songs]);
 
   return (
-    <AudioContext.Provider value={{ playingId, setPlayingId, songs, playNext, isPlaying, setIsPlaying }}>
+    <AudioCtx.Provider value={{ playingId, setPlayingId, playNext, isPlaying, setIsPlaying }}>
       {children}
-    </AudioContext.Provider>
+    </AudioCtx.Provider>
   );
 }
 
-// ─── Search Bar Component ───
-function SearchBar({ value, onChange }) {
-  return (
-    <div className="search-wrapper">
-      <span className="search-icon">🔍</span>
-      <input
-        type="text"
-        className="search-input"
-        placeholder="Suche nach Songs, Sketches oder Tags..."
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-      />
-    </div>
-  );
-}
-
-// ─── Skeleton Loader ───
-function SongSkeleton() {
-  return (
-    <div className="song-cards">
-      {[1, 2, 3].map(i => (
-        <div key={i} className="skeleton skeleton-card" />
-      ))}
-    </div>
-  );
-}
-
-// ─── Activity Stream Component ───
-function ActivityStream({ ratings, songs }) {
-  const recent = useMemo(() => {
-    return [...ratings]
-      .sort((a, b) => new Date(b.rated_at) - new Date(a.rated_at))
-      .slice(0, 5);
-  }, [ratings]);
-
-  if (recent.length === 0) return null;
-
-  return (
-    <div className="activity-stream">
-      <div className="section-header">
-        <span className="section-title">Letzte Aktivitäten</span>
-      </div>
-      {recent.map(r => {
-        const song = songs.find(s => s.id === r.song_id);
-        if (!song) return null;
-        const avg = (r.melody + r.production + r.emotion + r.originality) / 4;
-        return (
-          <div key={`${r.song_id}-${r.username}`} className="activity-item">
-            <div className="activity-avatar">{r.username[0].toUpperCase()}</div>
-            <div className="activity-content">
-              <b>{r.username === 'bennett' ? 'Bennett' : r.username}</b> bewertete <b>{song.originalname}</b> mit {avg.toFixed(1)} ★
-              <span className="time">{new Date(r.rated_at).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ─── Custom Audio Player ───
-function AudioPlayer({ src, type, songId }) {
-  const { playingId, setPlayingId, playNext, isPlaying, setIsPlaying } = useContext(AudioContext);
-  const audioRef = useRef(null);
-  const progressRef = useRef(null);
+// ─── Waveform Player (WaveSurfer.js + Framer Motion) ───
+function WaveformPlayer({ src, type, songId }) {
+  const { playingId, setPlayingId, isPlaying, setIsPlaying, playNext } = useContext(AudioCtx);
+  const containerRef = useRef(null);
+  const wavesurferRef = useRef(null);
   const volumeTrackRef = useRef(null);
-  const [currentTime, setCurrent] = useState(0);
+  const [ready, setReady] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(((-20 + 60) / 60));
+  const [volume, setVolume] = useState((-20 + 60) / 60);
   const [draggingVol, setDraggingVol] = useState(false);
-  const [isSticky, setIsSticky] = useState(false);
-  const playerRef = useRef(null);
 
   const dbToLinear = (db) => Math.pow(10, db / 20);
   const sliderToDb = (slider) => slider * 60 - 60;
   const dbToSlider = (db) => (db + 60) / 60;
+  const fmt = (s) => { if (!s || !isFinite(s)) return '0:00'; return `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, '0')}`; };
+  const getDB = () => { if (volume < 0.001) return '-∞'; return sliderToDb(volume).toFixed(1); };
 
-  const fmt = (s) => {
-    if (!s || !isFinite(s)) return '0:00';
-    const m = Math.floor(s / 60);
-    const sec = Math.floor(s % 60);
-    return `${m}:${sec.toString().padStart(2, '0')}`;
-  };
+  const isActive = playingId === songId && isPlaying;
+  const progressColor = type === 'sketch' ? '#f59e0b' : '#34d399';
 
-  const getDB = () => {
-    const db = sliderToDb(volume);
-    if (volume < 0.001) return '-∞';
-    return db.toFixed(1);
-  };
+  // Init WaveSurfer
+  useEffect(() => {
+    if (!containerRef.current) return;
+    let ws = null;
+    const init = async () => {
+      const WaveSurfer = (await import('wavesurfer.js')).default;
+      ws = WaveSurfer.create({
+        container: containerRef.current,
+        waveColor: 'rgba(255,255,255,0.12)',
+        progressColor: progressColor,
+        cursorColor: 'transparent',
+        barWidth: 2,
+        barRadius: 2,
+        barGap: 2,
+        height: 48,
+        responsive: true,
+        normalize: true,
+        backend: 'MediaElement',
+        interact: true,
+      });
+      ws.load(src);
+      ws.on('ready', () => { setDuration(ws.getDuration()); setReady(true); });
+      ws.on('audioprocess', () => setCurrentTime(ws.getCurrentTime()));
+      ws.on('seeking', () => setCurrentTime(ws.getCurrentTime()));
+      ws.on('finish', () => { setIsPlaying(false); setCurrentTime(0); playNext(); });
+      ws.setVolume(dbToLinear(sliderToDb(volume)));
+      wavesurferRef.current = ws;
+    };
+    init();
+    return () => { if (ws) ws.destroy(); };
+  }, [src]);
+
+  // Sync with global context
+  useEffect(() => {
+    const ws = wavesurferRef.current;
+    if (!ws || !ready) return;
+    if (playingId === songId) {
+      if (isPlaying && !ws.isPlaying()) ws.play();
+      else if (!isPlaying && ws.isPlaying()) ws.pause();
+    } else {
+      if (ws.isPlaying()) ws.pause();
+      ws.seekTo(0);
+      setCurrentTime(0);
+    }
+  }, [playingId, isPlaying, songId, ready]);
 
   const toggle = () => {
-    if (!audioRef.current) return;
-    if (playingId === songId && isPlaying) {
-      audioRef.current.pause();
+    if (!wavesurferRef.current || !ready) return;
+    if (isActive) {
+      wavesurferRef.current.pause();
       setIsPlaying(false);
     } else {
       setPlayingId(songId);
       setIsPlaying(true);
-      // Wait for next tick to ensure src is loaded if it changed
-      setTimeout(() => audioRef.current.play().catch(() => {}), 0);
+      wavesurferRef.current.play();
     }
   };
 
-  // Sticky Detection
-  useEffect(() => {
-    const onScroll = () => {
-      if (!playerRef.current || playingId !== songId) {
-        setIsSticky(false);
-        return;
-      }
-      const rect = playerRef.current.getBoundingClientRect();
-      setIsSticky(rect.top < -50);
-    };
-    window.addEventListener('scroll', onScroll);
-    return () => window.removeEventListener('scroll', onScroll);
-  }, [playingId, songId]);
-
-  // Sync state with global context
-  useEffect(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    if (playingId === songId) {
-      if (isPlaying) a.play().catch(() => {});
-      else a.pause();
-    } else {
-      a.pause();
-      a.currentTime = 0;
-    }
-  }, [playingId, songId, isPlaying]);
-
-  const seek = (e) => {
-    if (!audioRef.current || !progressRef.current) return;
-    const rect = progressRef.current.getBoundingClientRect();
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    audioRef.current.currentTime = pct * duration;
-  };
-
+  // Volume
   const applyVolume = useCallback((e) => {
     if (!volumeTrackRef.current) return;
     const rect = volumeTrackRef.current.getBoundingClientRect();
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const sliderPos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    setVolume(sliderPos);
-    const linear = dbToLinear(sliderToDb(sliderPos));
-    if (audioRef.current) audioRef.current.volume = linear;
+    const pos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    setVolume(pos);
+    if (wavesurferRef.current) wavesurferRef.current.setVolume(dbToLinear(sliderToDb(pos)));
   }, []);
 
-  const onVolDown = (e) => {
-    setDraggingVol(true);
-    applyVolume(e);
-  };
-
+  const onVolDown = (e) => { setDraggingVol(true); applyVolume(e); };
   useEffect(() => {
     if (!draggingVol) return;
     const onMove = (e) => { e.preventDefault(); applyVolume(e); };
@@ -195,105 +142,199 @@ function AudioPlayer({ src, type, songId }) {
     window.addEventListener('mouseup', onUp);
     window.addEventListener('touchmove', onMove, { passive: false });
     window.addEventListener('touchend', onUp);
-    return () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      window.removeEventListener('touchmove', onMove);
-      window.removeEventListener('touchend', onUp);
-    };
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); window.removeEventListener('touchmove', onMove); window.removeEventListener('touchend', onUp); };
   }, [draggingVol, applyVolume]);
 
   const toggleMute = () => {
-    const newSlider = volume > 0.001 ? 0 : dbToSlider(-20);
-    setVolume(newSlider);
-    const linear = dbToLinear(sliderToDb(newSlider));
-    if (audioRef.current) audioRef.current.volume = linear;
+    const newV = volume > 0.001 ? 0 : dbToSlider(-20);
+    setVolume(newV);
+    if (wavesurferRef.current) wavesurferRef.current.setVolume(dbToLinear(sliderToDb(newV)));
   };
 
-  useEffect(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
-    const onTime = () => setCurrent(a.currentTime);
-    const onMeta = () => setDuration(a.duration);
-    const onEnd = () => { 
-      setIsPlaying(false); 
-      setCurrent(0); 
-      playNext();
-    };
-    a.addEventListener('play', onPlay);
-    a.addEventListener('pause', onPause);
-    a.addEventListener('timeupdate', onTime);
-    a.addEventListener('loadedmetadata', onMeta);
-    a.addEventListener('ended', onEnd);
-    return () => {
-      a.removeEventListener('play', onPlay);
-      a.removeEventListener('pause', onPause);
-      a.removeEventListener('timeupdate', onTime);
-      a.removeEventListener('loadedmetadata', onMeta);
-      a.removeEventListener('ended', onEnd);
-    };
-  }, [playNext, setIsPlaying]);
-
-  const pct = duration > 0 ? (currentTime / duration) * 100 : 0;
-  const fillClass = type === 'sketch' ? 'sketch-fill' : 'song-fill';
-  const eqClass = type === 'sketch' ? 'sketch-eq' : 'song-eq';
   const volPct = volume * 100;
-  const isActive = playingId === songId && isPlaying;
 
   return (
-    <div ref={playerRef} className={`custom-player ${isSticky ? 'is-sticky' : ''}`}>
-      <audio ref={audioRef} src={src} preload="none" />
-      <button className="player-play-btn" onClick={toggle} aria-label={isActive ? 'Pausieren' : 'Abspielen'}>
-        {isActive ? '❚❚' : '▶'}
-      </button>
-
-      <div className="eq-bars">
-        <div className={`eq-bar ${eqClass} ${isActive ? 'active' : ''}`} style={{ height: isActive ? undefined : '4px' }} />
-        <div className={`eq-bar ${eqClass} ${isActive ? 'active' : ''}`} style={{ height: isActive ? undefined : '4px' }} />
-        <div className={`eq-bar ${eqClass} ${isActive ? 'active' : ''}`} style={{ height: isActive ? undefined : '4px' }} />
+    <div className="waveform-player">
+      <div className="waveform-controls">
+        <motion.button 
+          className={`player-play-btn ${isActive ? 'active' : ''}`} 
+          onClick={toggle} 
+          whileTap={{ scale: 0.9 }}
+          aria-label={isActive ? 'Pausieren' : 'Abspielen'}
+        >
+          {isActive ? <HiPause /> : <HiPlay />}
+        </motion.button>
+        <span className="player-time mono">{fmt(currentTime)}</span>
       </div>
 
-      <span className="player-time">{fmt(currentTime)}</span>
-      <div className="progress-bar" ref={progressRef} onClick={seek} onTouchStart={seek}>
-        <div className={`progress-bar-fill ${fillClass}`} style={{ width: `${pct}%` }} />
-      </div>
-      <span className="player-time">{fmt(duration)}</span>
-
-      <div className={`volume-wrapper ${draggingVol ? 'locked' : ''}`}>
-        <button className="volume-icon-btn" onClick={toggleMute} title="Stumm">
-          {volume < 0.05 ? '🔇' : volume < 0.35 ? '🔈' : volume < 0.65 ? '🔉' : '🔊'}
-        </button>
-        <div className="volume-track-wrap">
-          <div className="volume-track" ref={volumeTrackRef} onMouseDown={onVolDown} onTouchStart={onVolDown}>
-            <div className="volume-track-fill" style={{ width: `${volPct}%` }} />
+      <div className="waveform-center">
+        <div ref={containerRef} className="waveform-container" />
+        {!ready && (
+          <div className="waveform-loading">
+            <div className="skeleton" style={{ width: '100%', height: '48px', borderRadius: '4px' }} />
           </div>
-          <span className="volume-db">{getDB()} dB</span>
-        </div>
+        )}
       </div>
-      <a href={`/api/stream/${songId}?download=true`} className="btn-download" title="Download" download>
-        📥
-      </a>
+
+      <div className="waveform-right">
+        <span className="player-time mono">{fmt(duration)}</span>
+        <div className={`volume-wrapper ${draggingVol ? 'locked' : ''}`}>
+          <button className="volume-icon-btn" onClick={toggleMute} title="Stumm">
+            {volume < 0.05 ? <HiSpeakerXMark /> : <HiSpeakerWave />}
+          </button>
+          <div className="volume-track-wrap">
+            <div className="volume-track" ref={volumeTrackRef} onMouseDown={onVolDown} onTouchStart={onVolDown}>
+              <div className="volume-track-fill" style={{ width: `${volPct}%` }} />
+            </div>
+            <span className="volume-db mono">{getDB()} dB</span>
+          </div>
+        </div>
+        <a href={`/api/stream/${songId}?download=true`} className="btn-download" title="Download" download>
+          <HiArrowDownTray />
+        </a>
+      </div>
     </div>
   );
 }
 
-// ─── Star Rating Input ───
+// ─── Upload Dropzone (react-dropzone) ───
+function UploadDropzone({ user, uploadType, setUploadType, onUploaded }) {
+  const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState(0);
+
+  const onDrop = useCallback(async (accepted) => {
+    const file = accepted[0];
+    if (!file) return;
+    if (!file.type.startsWith('audio/')) {
+      toast.error('Bitte lade eine Audiodatei hoch');
+      return;
+    }
+    setUploading(true);
+    setProgress(0);
+    const interval = setInterval(() => setProgress(p => Math.min(p + 8, 90)), 200);
+    const formData = new FormData();
+    formData.append('song', file);
+    formData.append('uploader', user);
+    formData.append('type', uploadType);
+    try {
+      const res = await fetch('/api/upload', { method: 'POST', body: formData });
+      clearInterval(interval);
+      setProgress(100);
+      if (res.ok) { toast.success(`${uploadType === 'sketch' ? 'Skizze' : 'Song'} hochgeladen!`); onUploaded(); }
+      else { const err = await res.json(); toast.error(err.error || 'Upload fehlgeschlagen'); }
+    } catch { clearInterval(interval); toast.error('Netzwerkfehler beim Upload'); }
+    finally { setTimeout(() => { setUploading(false); setProgress(0); }, 600); }
+  }, [user, uploadType, onUploaded]);
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: { 'audio/*': ['.mp3', '.wav', '.flac', '.ogg', '.aac', '.m4a'] },
+    maxFiles: 1,
+    disabled: uploading,
+  });
+
+  return (
+    <motion.section 
+      className="upload-card"
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+    >
+      <div className="type-selector">
+        {['song', 'sketch'].map(t => (
+          <motion.div key={t} className={`type-option ${uploadType === t ? 'active' : ''}`} data-type={t} onClick={() => setUploadType(t)} whileTap={{ scale: 0.95 }}>
+            {t === 'song' ? <><HiMusicalNote /> Song</> : <><HiSparkles /> Skizze</>}
+          </motion.div>
+        ))}
+      </div>
+      <div {...getRootProps()} className={`upload-area ${isDragActive ? 'drag-over' : ''} ${uploading ? 'uploading' : ''}`}>
+        <input {...getInputProps()} />
+        {uploading ? (
+          <div className="upload-progress-wrap">
+            <div className="upload-progress-bar">
+              <motion.div className="upload-progress-fill" initial={{ width: 0 }} animate={{ width: `${progress}%` }} transition={{ duration: 0.3 }} />
+            </div>
+            <span className="upload-progress-text mono">{progress}%</span>
+          </div>
+        ) : (
+          <motion.div animate={isDragActive ? { scale: 1.05, y: -5 } : { scale: 1, y: 0 }} className="upload-content">
+            <div className="upload-icon"><HiPlus /></div>
+            <p className="upload-label">{isDragActive ? 'Loslassen zum Hochladen' : 'Ablegen oder klicken'}</p>
+            <span className="upload-hint">MP3, WAV, FLAC, OGG, AAC</span>
+          </motion.div>
+        )}
+      </div>
+    </motion.section>
+  );
+}
+
+// ─── Search Bar ───
+function SearchBar({ value, onChange }) {
+  return (
+    <motion.div className="search-wrapper" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15 }}>
+      <HiMagnifyingGlass className="search-icon" />
+      <input type="text" className="search-input" placeholder="Songs, Skizzen durchsuchen..." value={value} onChange={(e) => onChange(e.target.value)} />
+      {value && <button className="search-clear" onClick={() => onChange('')}><HiXMark /></button>}
+    </motion.div>
+  );
+}
+
+// ─── Skeleton Loader ───
+function SongSkeleton() {
+  return (
+    <div className="song-cards">
+      {[1, 2, 3].map(i => (
+        <div key={i} className="skeleton skeleton-card" style={{ animationDelay: `${i * 0.15}s` }} />
+      ))}
+    </div>
+  );
+}
+
+// ─── Activity Stream (date-fns + Framer Motion) ───
+const ActivityStream = memo(({ ratings, songs }) => {
+  const recent = useMemo(() =>
+    [...ratings].sort((a, b) => new Date(b.rated_at) - new Date(a.rated_at)).slice(0, 6), [ratings]
+  );
+  if (!recent.length) return null;
+  return (
+    <motion.div className="activity-stream" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.3 }}>
+      <div className="section-header">
+        <HiClock style={{ color: 'var(--text-muted)', fontSize: '14px' }} />
+        <span className="section-title">Letzte Aktivitäten</span>
+      </div>
+      <AnimatePresence>
+        {recent.map((r, i) => {
+          const song = songs.find(s => s.id === r.song_id);
+          if (!song) return null;
+          const avg = (r.melody + r.production + r.emotion + r.originality) / 4;
+          const timeAgo = formatDistanceToNow(new Date(r.rated_at), { locale: de, addSuffix: true });
+          return (
+            <motion.div key={`${r.song_id}-${r.username}`} className="activity-item"
+              initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.05 }}>
+              <div className="activity-avatar">{r.username[0].toUpperCase()}</div>
+              <div className="activity-content">
+                <b>{r.username}</b> bewertete <b>{song.originalname}</b> mit {avg.toFixed(1)} ★
+                <span className="time">{timeAgo}</span>
+              </div>
+            </motion.div>
+          );
+        })}
+      </AnimatePresence>
+    </motion.div>
+  );
+});
+ActivityStream.displayName = 'ActivityStream';
+
+// ─── Star Rating Input (Framer Motion) ───
 function StarInput({ value, onChange, color = 'var(--accent)' }) {
   const [hover, setHover] = useState(0);
   return (
     <div className="star-input" onMouseLeave={() => setHover(0)}>
       {[1, 2, 3, 4, 5].map(i => (
-        <span
-          key={i}
-          className={`star ${i <= (hover || value) ? 'filled' : ''}`}
-          style={{ '--star-color': color }}
-          onMouseEnter={() => setHover(i)}
-          onClick={() => onChange(i)}
-        >
-          ★
-        </span>
+        <motion.span key={i} className={`star ${i <= (hover || value) ? 'filled' : ''}`}
+          style={{ '--star-color': color }} onMouseEnter={() => setHover(i)} onClick={() => onChange(i)}
+          whileHover={{ scale: 1.3, rotate: 8 }} whileTap={{ scale: 0.8 }}
+          animate={i <= value ? { scale: [1, 1.3, 1] } : {}} transition={{ duration: 0.2 }}>★</motion.span>
       ))}
     </div>
   );
@@ -332,7 +373,7 @@ const CRITERIA = [
   { key: 'originality', label: 'Originalität', icon: '✨', color: '#fbbf24' },
 ];
 
-function RatingPanel({ songId, user, ratings, onRate, showToast }) {
+function RatingPanel({ songId, user, ratings, onRate }) {
   const [open, setOpen] = useState(false);
   const [scores, setScores] = useState({ melody: 0, production: 0, emotion: 0, originality: 0 });
   const [submitting, setSubmitting] = useState(false);
@@ -362,7 +403,7 @@ function RatingPanel({ songId, user, ratings, onRate, showToast }) {
   const submitRating = async () => {
     const allFilled = Object.values(scores).every(v => v >= 1);
     if (!allFilled) {
-      showToast('Bitte bewerte alle Kategorien', 'error');
+      toast.error('Bitte bewerte alle Kategorien');
       return;
     }
     setSubmitting(true);
@@ -373,14 +414,14 @@ function RatingPanel({ songId, user, ratings, onRate, showToast }) {
         body: JSON.stringify({ song_id: songId, username: user, ...scores }),
       });
       if (res.ok) {
-        showToast(hasRated ? 'Bewertung aktualisiert' : 'Bewertung gespeichert');
+        toast.success(hasRated ? 'Bewertung aktualisiert' : 'Bewertung gespeichert ⭐');
         onRate();
       } else {
         const err = await res.json();
-        showToast(err.error || 'Fehler beim Bewerten', 'error');
+        toast.error(err.error || 'Fehler beim Bewerten');
       }
     } catch {
-      showToast('Netzwerkfehler', 'error');
+      toast.error('Netzwerkfehler');
     } finally {
       setSubmitting(false);
     }
@@ -404,16 +445,24 @@ function RatingPanel({ songId, user, ratings, onRate, showToast }) {
             </div>
           ))}
           {user && (
-            <button className={`rating-toggle-btn ${open ? 'open' : ''}`}>
-              {open ? '▾' : '▸'}
-            </button>
+            <motion.button className="rating-toggle-btn" animate={{ rotate: open ? 90 : 0 }} transition={{ duration: 0.2 }}>
+              <HiChevronRight />
+            </motion.button>
           )}
         </div>
       </div>
 
       {/* Expanded rating form */}
+      <AnimatePresence>
       {open && user && (
-        <div className="rating-form">
+        <motion.div className="rating-form"
+          initial={{ height: 0, opacity: 0 }}
+          animate={{ height: 'auto', opacity: 1 }}
+          exit={{ height: 0, opacity: 0 }}
+          transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+          style={{ overflow: 'hidden' }}
+        >
+          <div className="rating-form-inner">
           <div className="rating-form-header">
             <span className="rating-form-title">{hasRated ? 'Deine Bewertung bearbeiten' : 'Jetzt bewerten'}</span>
             <span className="rating-form-user">{user}</span>
@@ -433,13 +482,14 @@ function RatingPanel({ songId, user, ratings, onRate, showToast }) {
               </div>
             ))}
           </div>
-          <button
+          <motion.button
             className="btn btn-rate"
             onClick={submitRating}
             disabled={submitting}
+            whileTap={{ scale: 0.96 }}
           >
             {submitting ? '...' : hasRated ? 'Aktualisieren' : 'Bewertung abgeben'}
-          </button>
+          </motion.button>
 
           {/* Alle Bewertungen */}
           {ratings.length > 0 && (
@@ -448,8 +498,10 @@ function RatingPanel({ songId, user, ratings, onRate, showToast }) {
               {ratings.map(r => {
                 const isMe = r.username === user;
                 const avg = (r.melody + r.production + r.emotion + r.originality) / 4;
+                const timeAgo = formatDistanceToNow(new Date(r.rated_at), { locale: de, addSuffix: true });
                 return (
-                  <div key={r.id} className={`user-rating-card ${isMe ? 'is-me' : ''}`}>
+                  <motion.div key={r.id} className={`user-rating-card ${isMe ? 'is-me' : ''}`}
+                    initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
                     <div className="user-rating-header">
                       <div className="user-rating-avatar">{r.username.charAt(0).toUpperCase()}</div>
                       <div className="user-rating-meta">
@@ -457,12 +509,10 @@ function RatingPanel({ songId, user, ratings, onRate, showToast }) {
                           {r.username}
                           {isMe && <span className="user-rating-badge">Du</span>}
                         </span>
-                        <span className="user-rating-date">
-                          {new Date(r.rated_at).toLocaleDateString('de-DE', { day: 'numeric', month: 'short', year: 'numeric' })}
-                        </span>
+                        <span className="user-rating-date">{timeAgo}</span>
                       </div>
                       <div className="user-rating-avg">
-                        <span className="user-rating-avg-star">★</span>
+                        <HiStar style={{ color: 'var(--accent)', fontSize: '14px' }} />
                         <span className="user-rating-avg-val">{avg.toFixed(1)}</span>
                       </div>
                     </div>
@@ -480,59 +530,68 @@ function RatingPanel({ songId, user, ratings, onRate, showToast }) {
                         </div>
                       ))}
                     </div>
-                  </div>
+                  </motion.div>
                 );
               })}
             </div>
           )}
-        </div>
+          </div>
+        </motion.div>
       )}
+      </AnimatePresence>
     </div>
   );
 }
 
-// ─── Song Card ───
-function SongCard({ song, type, canDelete, onDelete, user, ratings, onRate, showToast }) {
+// ─── Song Card (Framer Motion + WaveSurfer + react-icons) ───
+const SongCard = memo(({ song, type, canDelete, onDelete, user, ratings, onRate, index }) => {
   return (
-    <div className="song-card">
+    <motion.div className="song-card"
+      layout
+      initial={{ opacity: 0, y: 24 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, scale: 0.95 }}
+      transition={{ duration: 0.4, delay: index * 0.05, ease: [0.16, 1, 0.3, 1] }}
+      whileHover={{ y: -3, transition: { duration: 0.2 } }}
+    >
       <div className="song-card-top">
         <div className={`song-card-indicator ${type}`} />
         <div className="song-card-info">
           <div className="song-card-name">{song.originalname}</div>
           <div className="song-card-meta">
             <span className={`song-card-type ${type}`}>
-              {type === 'sketch' ? 'Skizze' : 'Song'}
+              {type === 'sketch' ? <><HiSparkles /> Skizze</> : <><HiMusicalNote /> Song</>}
             </span>
-            <span>·</span>
-            <span>{new Date(song.uploaded_at).toLocaleDateString()}</span>
+            <span className="meta-dot">·</span>
+            <span>{formatDistanceToNow(new Date(song.uploaded_at), { locale: de, addSuffix: true })}</span>
           </div>
         </div>
         <div className="song-card-actions">
           {canDelete && (
-            <button onClick={() => onDelete(song.id)} className="btn btn-danger" title="Löschen">✕</button>
+            <motion.button onClick={() => onDelete(song.id)} className="btn btn-danger" title="Löschen"
+              whileHover={{ rotate: 90, scale: 1.15 }} whileTap={{ scale: 0.85 }}>
+              <HiXMark />
+            </motion.button>
           )}
         </div>
       </div>
-      <AudioPlayer src={`/api/stream/${song.id}`} type={type} songId={song.id} />
-      <RatingPanel songId={song.id} user={user} ratings={ratings} onRate={onRate} showToast={showToast} />
-    </div>
+      <WaveformPlayer src={`/api/stream/${song.id}`} type={type} songId={song.id} />
+      <RatingPanel songId={song.id} user={user} ratings={ratings} onRate={onRate} />
+    </motion.div>
   );
-}
+});
+SongCard.displayName = 'SongCard';
 
 export default function Home() {
   const [user, setUser] = useState('');
   const [usernameInput, setUsernameInput] = useState('');
   const [songs, setSongs] = useState([]);
   const [ratings, setRatings] = useState({});
-  const [uploading, setUploading] = useState(false);
-  const [dragActive, setDragActive] = useState(false);
   const [uploadType, setUploadType] = useState('song');
-  const [toast, setToast] = useState({ message: '', show: false, type: 'info' });
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const fileInputRef = useRef(null);
 
-  const { playingId, isPlaying } = useContext(AudioContext);
+  const { playingId, isPlaying } = useContext(AudioCtx);
 
   useEffect(() => {
     const savedUser = localStorage.getItem('musik_user');
@@ -540,11 +599,6 @@ export default function Home() {
     fetchSongs();
     fetchAllRatings();
   }, []);
-
-  const showToast = (message, type = 'info') => {
-    setToast({ message, show: true, type });
-    setTimeout(() => setToast({ message: '', show: false, type: 'info' }), 3000);
-  };
 
   const fetchSongs = async () => {
     try {
@@ -591,7 +645,7 @@ export default function Home() {
     e.preventDefault();
     const name = usernameInput.trim();
     if (!name || name.length < 2) {
-      showToast('Bitte gib einen Namen ein (min. 2 Zeichen)', 'error');
+      toast.error('Bitte gib einen Namen ein (min. 2 Zeichen)');
       return;
     }
     const normalizedName = name.toLowerCase();
@@ -599,7 +653,7 @@ export default function Home() {
     localStorage.setItem('musik_user', normalizedName);
     const secure = window.location.protocol === 'https:' ? 'Secure; ' : '';
     document.cookie = `username=${normalizedName}; path=/; max-age=${60 * 60 * 24 * 365}; SameSite=Strict; ${secure}`;
-    showToast(`Willkommen, ${normalizedName}!`);
+    toast.success(`Willkommen, ${normalizedName}!`);
     setUsernameInput('');
   };
 
@@ -607,84 +661,25 @@ export default function Home() {
     setUser('');
     localStorage.removeItem('musik_user');
     document.cookie = 'username=; path=/; max-age=0';
-    showToast('Abgemeldet');
-  };
-
-  const handleDrag = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.type === "dragenter" || e.type === "dragover") setDragActive(true);
-    else if (e.type === "dragleave") setDragActive(false);
-  };
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleUpload(e.dataTransfer.files[0]);
-    }
-  };
-
-  const handleUpload = async (file) => {
-    if (!file) return;
-    if (!file.type.startsWith('audio/')) {
-      showToast('Bitte lade eine Audiodatei hoch', 'error');
-      return;
-    }
-
-    setUploading(true);
-    const formData = new FormData();
-    formData.append('song', file);
-    formData.append('uploader', user);
-    formData.append('type', uploadType);
-
-    try {
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (res.ok) {
-        showToast(`${uploadType === 'sketch' ? 'Skizze' : 'Song'} erfolgreich hochgeladen`);
-        fetchSongs();
-      } else {
-        const err = await res.json();
-        showToast(err.error || 'Upload fehlgeschlagen', 'error');
-      }
-    } catch (err) {
-      showToast('Netzwerkfehler beim Upload', 'error');
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
+    toast('Abgemeldet 👋');
   };
 
   const handleDelete = async (id) => {
-    if (!confirm('Bist du sicher, dass du diesen Titel löschen möchtest?')) return;
+    if (!confirm('Titel wirklich löschen?')) return;
     try {
       const res = await fetch(`/api/songs?id=${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        showToast('Erfolgreich gelöscht');
-        fetchSongs();
-      } else {
-        showToast('Löschen fehlgeschlagen', 'error');
-      }
-    } catch (err) {
-      showToast('Fehler beim Löschen', 'error');
-    }
+      if (res.ok) { toast.success('Gelöscht'); fetchSongs(); }
+      else toast.error('Löschen fehlgeschlagen');
+    } catch { toast.error('Fehler beim Löschen'); }
   };
 
-  const filteredSongs = useMemo(() => {
+  const filtered = useMemo(() => {
     if (!search) return songs;
     const s = search.toLowerCase();
-    return songs.filter(song => 
-      song.originalname.toLowerCase().includes(s) || 
-      (song.type || 'song').toLowerCase().includes(s)
-    );
+    return songs.filter(song => song.originalname.toLowerCase().includes(s) || (song.type || 'song').includes(s));
   }, [songs, search]);
 
-  const songsByType = (type) => filteredSongs.filter(s => (s.type || 'song') === type);
+  const byType = (t) => filtered.filter(s => (s.type || 'song') === t);
 
   // Dynamic Background Colors
   const ambientColors = useMemo(() => {
@@ -695,6 +690,8 @@ export default function Home() {
   }, [isPlaying, playingId, songs]);
 
   const allRatingsFlat = useMemo(() => Object.values(ratings).flat(), [ratings]);
+  const songCount = byType('song').length;
+  const sketchCount = byType('sketch').length;
 
   return (
     <AudioProvider songs={songs}>
@@ -709,174 +706,101 @@ export default function Home() {
         <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>" />
       </Head>
 
-      <div 
-        className="ambient-orb ambient-orb-1" 
-        style={{ '--ambient-1': ambientColors.c1 }} 
-      />
-      <div 
-        className="ambient-orb ambient-orb-2" 
-        style={{ '--ambient-2': ambientColors.c2 }} 
-      />
+      <div className="ambient-orb ambient-orb-1" style={{ '--ambient-1': ambientColors.c1 }} />
+      <div className="ambient-orb ambient-orb-2" style={{ '--ambient-2': ambientColors.c2 }} />
 
       <div className="container">
-        <header className="header">
+        {/* Header */}
+        <motion.header className="header"
+          initial={{ opacity: 0, y: -16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6 }}>
           <div className="header-left">
-            <h1>
-              <span className="logo-dot" /> musik
-            </h1>
-            <div className="bennett-signature">
-              <span className="bennett-tag">by bennett</span>
-            </div>
+            <h1><span className="logo-dot" /> musik</h1>
+            <div className="bennett-signature"><span className="bennett-tag">by bennett</span></div>
           </div>
           <div className="header-right">
             {!user ? (
-              <form onSubmit={handleLogin} style={{ display: 'flex', gap: '8px' }}>
-                <input
-                  type="text"
-                  className="login-input"
-                  placeholder="Dein Name"
-                  value={usernameInput}
-                  onChange={(e) => setUsernameInput(e.target.value)}
-                />
-                <button type="submit" className="btn btn-primary">Rein</button>
+              <form onSubmit={handleLogin} className="login-form">
+                <input type="text" className="login-input" placeholder="Dein Name" value={usernameInput} onChange={e => setUsernameInput(e.target.value)} />
+                <motion.button type="submit" className="btn btn-primary" whileTap={{ scale: 0.95 }}>
+                  <HiArrowRightOnRectangle /> Rein
+                </motion.button>
               </form>
             ) : (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-                <div className="user-badge" onClick={handleLogout} title="Abmelden">
-                  <div className="user-avatar">{user[0].toUpperCase()}</div>
-                  <span className="user-name">{user === 'bennett' ? 'Bennett' : user}</span>
-                </div>
-              </div>
+              <motion.div className="user-badge" onClick={handleLogout} title="Abmelden"
+                whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+                <div className="user-avatar">{user[0].toUpperCase()}</div>
+                <span className="user-name">{user === 'bennett' ? 'Bennett' : user}</span>
+              </motion.div>
             )}
           </div>
-        </header>
+        </motion.header>
 
+        {/* Upload */}
         {user === 'bennett' && (
-          <section className="upload-card">
-            <div className="type-selector">
-              <div 
-                className={`type-option ${uploadType === 'song' ? 'active' : ''}`}
-                data-type="song"
-                onClick={() => setUploadType('song')}
-              >
-                Song
-              </div>
-              <div 
-                className={`type-option ${uploadType === 'sketch' ? 'active' : ''}`}
-                data-type="sketch"
-                onClick={() => setUploadType('sketch')}
-              >
-                Skizze
-              </div>
-            </div>
-
-            <div 
-              className={`upload-area ${dragActive ? 'drag-over' : ''}`}
-              onDragEnter={handleDrag}
-              onDragLeave={handleDrag}
-              onDragOver={handleDrag}
-              onDrop={handleDrop}
-              onClick={() => !uploading && fileInputRef.current?.click()}
-            >
-              <input
-                type="file"
-                ref={fileInputRef}
-                onChange={(e) => {
-                  if (e.target.files?.[0]) {
-                    handleUpload(e.target.files[0]);
-                  }
-                }}
-                accept="audio/*"
-                style={{ display: 'none' }}
-                tabIndex={-1}
-              />
-              <div className="upload-icon">
-                {uploading ? '⏳' : '+'}
-              </div>
-              <p className="upload-label">
-                {uploading ? 'Lädt hoch…' : `Hier ablegen oder klicken zum Durchsuchen`}
-              </p>
-            </div>
-          </section>
+          <UploadDropzone user={user} uploadType={uploadType} setUploadType={setUploadType} onUploaded={fetchSongs} />
         )}
 
+        {/* Search */}
         <SearchBar value={search} onChange={setSearch} />
 
+        {/* Songs */}
         {loading ? (
           <SongSkeleton />
         ) : (
-          <>
-            {/* Songs */}
-            {songsByType('song').length > 0 && (
-              <>
-                <div className="section-header">
-                  <span className="section-title">Songs</span>
-                  <span className="section-count">{songsByType('song').length}</span>
-                </div>
-                <div className="song-cards">
-                  {songsByType('song').map(song => (
-                    <SongCard
-                      key={song.id}
-                      song={song}
-                      type="song"
-                      canDelete={user === 'bennett'}
-                      onDelete={handleDelete}
-                      user={user}
-                      ratings={ratings[song.id] || []}
-                      onRate={() => refreshSongRatings(song.id)}
-                      showToast={showToast}
-                    />
-                  ))}
-                </div>
-              </>
-            )}
+          <LayoutGroup>
+            <AnimatePresence mode="popLayout">
+              {songCount > 0 && (
+                <motion.div key="songs-section" layout>
+                  <div className="section-header">
+                    <HiMusicalNote style={{ color: 'var(--song-color)' }} />
+                    <span className="section-title">Songs</span>
+                    <span className="section-count">{songCount}</span>
+                  </div>
+                  <div className="song-cards">
+                    <AnimatePresence mode="popLayout">
+                      {byType('song').map((song, i) => (
+                        <SongCard key={song.id} song={song} type="song" canDelete={user === 'bennett'} onDelete={handleDelete} user={user} ratings={ratings[song.id] || []} onRate={() => refreshSongRatings(song.id)} index={i} />
+                      ))}
+                    </AnimatePresence>
+                  </div>
+                </motion.div>
+              )}
 
-            {/* Sketches */}
-            {songsByType('sketch').length > 0 && (
-              <>
-                <div className="section-divider" />
-                <div className="section-header">
-                  <span className="section-title">Skizzen</span>
-                  <span className="section-count">{songsByType('sketch').length}</span>
-                </div>
-                <div className="song-cards">
-                  {songsByType('sketch').map(song => (
-                    <SongCard
-                      key={song.id}
-                      song={song}
-                      type="sketch"
-                      canDelete={user === 'bennett'}
-                      onDelete={handleDelete}
-                      user={user}
-                      ratings={ratings[song.id] || []}
-                      onRate={() => refreshSongRatings(song.id)}
-                      showToast={showToast}
-                    />
-                  ))}
-                </div>
-              </>
-            )}
+              {sketchCount > 0 && (
+                <motion.div key="sketch-section" layout>
+                  <div className="section-divider" />
+                  <div className="section-header">
+                    <HiSparkles style={{ color: 'var(--sketch-color)' }} />
+                    <span className="section-title">Skizzen</span>
+                    <span className="section-count">{sketchCount}</span>
+                  </div>
+                  <div className="song-cards">
+                    <AnimatePresence mode="popLayout">
+                      {byType('sketch').map((song, i) => (
+                        <SongCard key={song.id} song={song} type="sketch" canDelete={user === 'bennett'} onDelete={handleDelete} user={user} ratings={ratings[song.id] || []} onRate={() => refreshSongRatings(song.id)} index={i} />
+                      ))}
+                    </AnimatePresence>
+                  </div>
+                </motion.div>
+              )}
 
-            {filteredSongs.length === 0 && (
-              <div className="empty-state">
-                <span className="empty-icon">📭</span>
-                <p>Keine Einträge gefunden</p>
-              </div>
-            )}
-          </>
+              {filtered.length === 0 && (
+                <motion.div key="empty" className="empty-state" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+                  <span className="empty-icon">📭</span>
+                  <p>Keine Einträge gefunden</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </LayoutGroup>
         )}
 
+        {/* Activity */}
         <ActivityStream ratings={allRatingsFlat} songs={songs} />
 
+        {/* Footer */}
         <footer className="footer-brand">
-          <p className="footer-brand-text">
-            crafted by <span>bennett</span>
-          </p>
+          <p className="footer-brand-text">crafted by <span>bennett</span></p>
         </footer>
-
-        <div className={`toast ${toast.show ? 'show' : ''} ${toast.type === 'error' ? 'error' : ''}`}>
-          {toast.message}
-        </div>
       </div>
     </AudioProvider>
   );
