@@ -44,6 +44,79 @@ function AudioProvider({ children, songs }) {
   );
 }
 
+// ─── Fallback Player (simple progress bar if WaveSurfer fails) ───
+function FallbackPlayer({ src, type, songId }) {
+  const { playingId, setPlayingId, isPlaying, setIsPlaying, playNext } = useContext(AudioCtx);
+  const audioRef = useRef(null);
+  const progressRef = useRef(null);
+  const [currentTime, setCurrent] = useState(0);
+  const [duration, setDuration] = useState(0);
+
+  const isActive = playingId === songId && isPlaying;
+  const fillClass = type === 'sketch' ? 'sketch-fill' : 'song-fill';
+
+  const fmt = (s) => { if (!s || !isFinite(s)) return '0:00'; return `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, '0')}`; };
+
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    if (playingId === songId) {
+      if (isPlaying) a.play().catch(() => {});
+      else a.pause();
+    } else { a.pause(); a.currentTime = 0; }
+  }, [playingId, songId, isPlaying]);
+
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    const onTime = () => setCurrent(a.currentTime);
+    const onMeta = () => setDuration(a.duration);
+    const onEnd = () => { setIsPlaying(false); setCurrent(0); playNext(); };
+    a.addEventListener('timeupdate', onTime);
+    a.addEventListener('loadedmetadata', onMeta);
+    a.addEventListener('ended', onEnd);
+    return () => { a.removeEventListener('timeupdate', onTime); a.removeEventListener('loadedmetadata', onMeta); a.removeEventListener('ended', onEnd); };
+  }, [playNext, setIsPlaying]);
+
+  const toggle = () => {
+    if (!audioRef.current) return;
+    if (isActive) { audioRef.current.pause(); setIsPlaying(false); }
+    else { setPlayingId(songId); setIsPlaying(true); setTimeout(() => audioRef.current.play().catch(() => {}), 0); }
+  };
+
+  const seek = (e) => {
+    if (!audioRef.current || !progressRef.current) return;
+    const rect = progressRef.current.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    audioRef.current.currentTime = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) * duration;
+  };
+
+  const pct = duration > 0 ? (currentTime / duration) * 100 : 0;
+
+  return (
+    <div className="waveform-player">
+      <audio ref={audioRef} src={src} preload="none" />
+      <div className="waveform-controls">
+        <motion.button className={`player-play-btn ${isActive ? 'active' : ''}`} onClick={toggle} whileTap={{ scale: 0.9 }}>
+          {isActive ? <HiPause /> : <HiPlay />}
+        </motion.button>
+        <span className="player-time mono">{fmt(currentTime)}</span>
+      </div>
+      <div className="waveform-center">
+        <div className="progress-bar" ref={progressRef} onClick={seek} onTouchStart={seek}>
+          <div className={`progress-bar-fill ${fillClass}`} style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+      <div className="waveform-right">
+        <span className="player-time mono">{fmt(duration)}</span>
+        <a href={`/api/stream/${songId}?download=true`} className="btn-download" title="Download" download>
+          <HiArrowDownTray />
+        </a>
+      </div>
+    </div>
+  );
+}
+
 // ─── Waveform Player (WaveSurfer.js + Framer Motion) ───
 function WaveformPlayer({ src, type, songId }) {
   const { playingId, setPlayingId, isPlaying, setIsPlaying, playNext } = useContext(AudioCtx);
@@ -51,6 +124,7 @@ function WaveformPlayer({ src, type, songId }) {
   const wavesurferRef = useRef(null);
   const volumeTrackRef = useRef(null);
   const [ready, setReady] = useState(false);
+  const [failed, setFailed] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState((-20 + 60) / 60);
@@ -65,48 +139,71 @@ function WaveformPlayer({ src, type, songId }) {
   const isActive = playingId === songId && isPlaying;
   const progressColor = type === 'sketch' ? '#f59e0b' : '#34d399';
 
-  // Init WaveSurfer
+  // Init WaveSurfer — resolve presigned URL first, then load
   useEffect(() => {
     if (!containerRef.current) return;
     let ws = null;
+    let cancelled = false;
     const init = async () => {
-      const WaveSurfer = (await import('wavesurfer.js')).default;
-      ws = WaveSurfer.create({
-        container: containerRef.current,
-        waveColor: 'rgba(255,255,255,0.12)',
-        progressColor: progressColor,
-        cursorColor: 'transparent',
-        barWidth: 2,
-        barRadius: 2,
-        barGap: 2,
-        height: 48,
-        responsive: true,
-        normalize: true,
-        backend: 'MediaElement',
-        interact: true,
-      });
-      ws.load(src);
-      ws.on('ready', () => { setDuration(ws.getDuration()); setReady(true); });
-      ws.on('audioprocess', () => setCurrentTime(ws.getCurrentTime()));
-      ws.on('seeking', () => setCurrentTime(ws.getCurrentTime()));
-      ws.on('finish', () => { setIsPlaying(false); setCurrentTime(0); playNext(); });
-      ws.setVolume(dbToLinear(sliderToDb(volume)));
-      wavesurferRef.current = ws;
+      try {
+        // Get direct presigned URL (avoids CORS issues with 302 redirect)
+        const presignRes = await fetch(`/api/presign/${songId}`);
+        if (!presignRes.ok) throw new Error('presign failed');
+        const { url: directUrl } = await presignRes.json();
+        if (cancelled) return;
+
+        const WaveSurfer = (await import('wavesurfer.js')).default;
+        if (cancelled) return;
+
+        ws = WaveSurfer.create({
+          container: containerRef.current,
+          waveColor: 'rgba(255,255,255,0.15)',
+          progressColor: progressColor,
+          cursorColor: 'transparent',
+          barWidth: 2,
+          barRadius: 2,
+          barGap: 2,
+          height: 48,
+          fillParent: true,
+          normalize: true,
+          interact: true,
+          dragToSeek: true,
+          url: directUrl,
+        });
+
+        ws.on('ready', () => { 
+          if (!cancelled) { setDuration(ws.getDuration()); setReady(true); }
+        });
+        ws.on('timeupdate', (t) => { if (!cancelled) setCurrentTime(t); });
+        ws.on('finish', () => { 
+          if (!cancelled) { setIsPlaying(false); setCurrentTime(0); playNext(); }
+        });
+        ws.on('error', (err) => {
+          console.warn('[WaveSurfer] Error:', err);
+          if (!cancelled) setFailed(true);
+        });
+
+        ws.setVolume(dbToLinear(sliderToDb(volume)));
+        wavesurferRef.current = ws;
+      } catch (err) {
+        console.warn('[WaveSurfer] Init error:', err);
+        if (!cancelled) setFailed(true);
+      }
     };
     init();
-    return () => { if (ws) ws.destroy(); };
-  }, [src]);
+    return () => { cancelled = true; if (ws) ws.destroy(); wavesurferRef.current = null; };
+  }, [songId]);
 
   // Sync with global context
   useEffect(() => {
     const ws = wavesurferRef.current;
     if (!ws || !ready) return;
     if (playingId === songId) {
-      if (isPlaying && !ws.isPlaying()) ws.play();
+      if (isPlaying && !ws.isPlaying()) ws.play().catch(() => {});
       else if (!isPlaying && ws.isPlaying()) ws.pause();
     } else {
       if (ws.isPlaying()) ws.pause();
-      ws.seekTo(0);
+      ws.setTime(0);
       setCurrentTime(0);
     }
   }, [playingId, isPlaying, songId, ready]);
@@ -119,7 +216,7 @@ function WaveformPlayer({ src, type, songId }) {
     } else {
       setPlayingId(songId);
       setIsPlaying(true);
-      wavesurferRef.current.play();
+      wavesurferRef.current.play().catch(() => {});
     }
   };
 
@@ -152,6 +249,11 @@ function WaveformPlayer({ src, type, songId }) {
   };
 
   const volPct = volume * 100;
+
+  // Fallback player if waveform fails to load
+  if (failed) {
+    return <FallbackPlayer src={src} type={type} songId={songId} />;
+  }
 
   return (
     <div className="waveform-player">
